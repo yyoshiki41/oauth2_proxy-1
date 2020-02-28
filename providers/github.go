@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -20,6 +21,7 @@ type GitHubProvider struct {
 	*ProviderData
 	Org  string
 	Team string
+	User string
 }
 
 // NewGitHubProvider initiates a new GitHubProvider
@@ -60,10 +62,11 @@ func getGitHubHeader(accessToken string) http.Header {
 	return header
 }
 
-// SetOrgTeam adds GitHub org reading parameters to the OAuth2 scope
-func (p *GitHubProvider) SetOrgTeam(org, team string) {
+// SetOrgTeamUser adds GitHub org reading parameters to the OAuth2 scope
+func (p *GitHubProvider) SetOrgTeamUser(org, team, user string) {
 	p.Org = org
 	p.Team = team
+	p.User = user
 	if org != "" || team != "" {
 		p.Scope += " read:org"
 	}
@@ -260,6 +263,53 @@ func (p *GitHubProvider) hasOrgAndTeam(accessToken string) (bool, error) {
 	return false, nil
 }
 
+func (p *GitHubProvider) hasUser(accessToken string) (bool, error) {
+	// https://developer.github.com/v3/users/#get-the-authenticated-user
+
+	var user struct {
+		Login string `json:"login"`
+	}
+
+	endpoint := &url.URL{
+		Scheme:   p.ValidateURL.Scheme,
+		Host:     p.ValidateURL.Host,
+		Path:     path.Join(p.ValidateURL.Path, "/user"),
+		RawQuery: "",
+	}
+	req, _ := http.NewRequest("GET", endpoint.String(), nil)
+	req.Header = getGitHubHeader(accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode != 200 {
+		return false, fmt.Errorf(
+			"got %d from %q %s", resp.StatusCode, stripToken(endpoint.String()), body)
+	}
+
+	if err := json.Unmarshal(body, &user); err != nil {
+		return false, err
+	}
+
+	presentUsers := []string{user.Login}
+	us := strings.Split(p.User, ",")
+	for _, u := range us {
+		if u == user.Login {
+			log.Printf("Found Github User: %q", user.Login)
+			return true, nil
+		}
+	}
+
+	log.Printf("Missing User:%q in %v", p.User, presentUsers)
+	return false, nil
+}
+
 // GetEmailAddress returns the Account email address
 func (p *GitHubProvider) GetEmailAddress(s *sessions.SessionState) (string, error) {
 
@@ -270,15 +320,27 @@ func (p *GitHubProvider) GetEmailAddress(s *sessions.SessionState) (string, erro
 	}
 
 	// if we require an Org or Team, check that first
+	verifiedOrgOrTeam := false
 	if p.Org != "" {
+		var err error
 		if p.Team != "" {
-			if ok, err := p.hasOrgAndTeam(s.AccessToken); err != nil || !ok {
+			verifiedOrgOrTeam, err = p.hasOrgAndTeam(s.AccessToken)
+			if err != nil {
 				return "", err
 			}
 		} else {
-			if ok, err := p.hasOrg(s.AccessToken); err != nil || !ok {
+			verifiedOrgOrTeam, err = p.hasOrg(s.AccessToken)
+			if err != nil {
 				return "", err
 			}
+		}
+	}
+	if !verifiedOrgOrTeam {
+		if p.User == "" {
+			return "", fmt.Errorf("Missing Org or Team, and User is empty")
+		}
+		if ok, err := p.hasUser(s.AccessToken); err != nil || !ok {
+			return "", err
 		}
 	}
 
